@@ -1,0 +1,4 @@
+name = "Pyroscope"
+uuid = "0a65674c-6fa2-4b0e-b811-cc1852456df4"
+authors = ["Jonas Wilfert <jonas.wilfert@fibclick.de>"]
+version = "0.1.0"
