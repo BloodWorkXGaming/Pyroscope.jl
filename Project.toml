@@ -2,3 +2,15 @@ name = "Pyroscope"
 uuid = "0a65674c-6fa2-4b0e-b811-cc1852456df4"
 authors = ["Jonas Wilfert <jonas.wilfert@fibclick.de>"]
 version = "0.1.0"
+
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+PProf = "e4faabce-9ead-11e9-39d9-4379958e3056"
+Profile = "9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"
+
+[compat]
+Dates = "1.11.0"
+HTTP = "1.10.19"
+PProf = "3.2.0"
+Profile = "1.11.0"
