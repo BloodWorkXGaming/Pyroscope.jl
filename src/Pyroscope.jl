@@ -12,7 +12,7 @@ export start_profiling, example
 @kwdef struct ProfilerConfig
     sample_threshold::Int = 50_000
     time_threshold::Period = Second(10)
-    cpu_sample_interval::Float64 = 0.005
+    cpu_sample_interval::Float64 = 0.05
     alloc_sample_rate::Float64 = 0.001
     enable_cpu::Bool = true
     enable_alloc::Bool = true
@@ -93,11 +93,23 @@ function run_profiler_task(kind::Symbol, config::ProfilerConfig)
                 if n_samples > config.sample_threshold || time_since_upload > config.time_threshold
                     println("[Pyroscope.jl] Upload triggered for $(kind): $(n_samples) samples, $(time_since_upload) elapsed")
 
+
                     # Stop, fetch, upload, clear, restart
                     if kind == :cpu
+                        # we don't want to overload the system. throw away giant samples
+                        if (n_samples > 250_000)
+                            println("[Pyroscope.jl] throwing away to large sample size for $(kind): $(n_samples) samples")
+
+                            Profile.stop_timer()
+                            sleep(0.01)
+                            Profile.clear()
+                            continue
+                        end
+
                         Profile.stop_timer()
                         t_start = last_upload_time
                         t_end = now()
+                        sleep(0.01)
 
                         # fetch cpu data
                         data = Profile.fetch()
@@ -112,7 +124,7 @@ function run_profiler_task(kind::Symbol, config::ProfilerConfig)
 
                     elseif kind == :allocs
                         Profile.Allocs.stop()
-                        data = Profile.Allocs.fetch()
+                        sleep(0.01)
                         t_start = last_upload_time
                         t_end = now()
 
