@@ -6,38 +6,21 @@ using Base.Threads: @spawn, sleep
 export start_profiling, example
 
 # ------------------------------------------------------------------
-# Helpers
+# Configuration
 # ------------------------------------------------------------------
 
-mutable struct ProfilerConfig
-    interval::Float64
-    duration::Float64
-    enabled_cpu::Bool
-    enabled_alloc::Bool
+@kwdef struct ProfilerConfig
+    sample_threshold::Int = 50_000
+    time_threshold::Period = Second(10)
+    cpu_sample_interval::Float64 = 0.005
+    alloc_sample_rate::Float64 = 0.001
+    enable_cpu::Bool = true
+    enable_alloc::Bool = true
 end
 
-const DEFAULT_CONFIG = ProfilerConfig(60.0, 5.0, true, true)
-
-function collect_pprof_snapshot(kind::Symbol; duration::Real=5.0, outpath::AbstractString="profile.pb.gz")
-    t_start = Dates.now()
-    if kind == :cpu
-        Profile.clear()
-        @profile sleep(duration)
-
-        PProf.pprof(; web=false, out=outpath)
-        data = Profile.fetch()
-    elseif kind == :allocs
-        Profile.Allocs.clear()
-        Profile.Allocs.@profile sample_rate = 0.01 sleep(duration)
-        PProf.Allocs.pprof(; web=false, out=outpath)
-    else
-        error("Unknown profile kind: $kind")
-    end
-    t_end = Dates.now()
-
-    return outpath, t_start, t_end
-end
-
+# ------------------------------------------------------------------
+# Upload helpers
+# ------------------------------------------------------------------
 
 function upload_pprof(outpath::AbstractString; t_start::DateTime, t_end::DateTime, profile_type::String="cpu")
     server = get(ENV, "PYROSCOPE_SERVER", "http://localhost:4040")
@@ -60,43 +43,114 @@ function upload_pprof(outpath::AbstractString; t_start::DateTime, t_end::DateTim
 
     try
         resp = HTTP.post(url, headers, gzdata)
-        println("[Pyroscope] Uploaded $(profile_type) profile (status=$(resp.status))")
+        println("[Pyroscope.jl] Uploaded $(profile_type) profile (status=$(resp.status))")
     catch e
-        @warn "[Pyroscope] Upload failed for $(profile_type): $e"
+        @warn "[Pyroscope.jl] Upload failed for $(profile_type): $e"
     end
 end
 
 # ------------------------------------------------------------------
-# Continuous profiling controller with graceful shutdown via Ctrl+C
+# Continuous profiler logic
 # ------------------------------------------------------------------
 
-const profiler_tasks = Ref{Vector{Task}}(Vector{Task}())
 const shutdown_flag = Ref(false)
 
 function run_profiler_task(kind::Symbol, config::ProfilerConfig)
     @spawn begin
-        while !shutdown_flag[] && ((kind == :cpu && config.enabled_cpu) || (kind == :allocs && config.enabled_alloc))
-            try
-                file, t_start, t_end = collect_pprof_snapshot(kind; duration=config.duration,
-                    outpath="$(kind)_profile.pb.gz")
-                upload_pprof(file; t_start=t_start, t_end=t_end, profile_type=string(kind))
-            catch e
-                @warn "$(kind) profiling iteration failed: $e"
+        try
+            println("[Pyroscope.jl] Starting $(kind) profiler (threshold-based continuous mode)...")
+
+            outpath = "$(kind)_profile.pb.gz"
+
+
+            # Configure and start timers
+            if kind == :cpu
+                Profile.init(; delay=config.cpu_sample_interval)
+                Profile.start_timer()
+            elseif kind == :allocs
+                Profile.Allocs.start(; sample_rate=config.alloc_sample_rate)
             end
-            # sleep(config.interval)
+
+            last_upload_time = now()
+            while !shutdown_flag[]
+                sleep(1.0)  # check once per second
+
+                Profile.fetch()
+
+                # Efficient count check (no copying)
+                n_samples = if kind == :cpu
+                    Profile.len_data()
+                elseif kind == :allocs
+                    # we can't get efficient information about the length of the allocations.
+                    0
+                else
+                    0
+                end
+
+                time_since_upload = now() - last_upload_time
+
+                # Trigger upload on count or time threshold
+                if n_samples > config.sample_threshold || time_since_upload > config.time_threshold
+                    println("[Pyroscope.jl] Upload triggered for $(kind): $(n_samples) samples, $(time_since_upload) elapsed")
+
+                    # Stop, fetch, upload, clear, restart
+                    if kind == :cpu
+                        Profile.stop_timer()
+                        t_start = last_upload_time
+                        t_end = now()
+
+                        # fetch cpu data
+                        data = Profile.fetch()
+
+                        # clear profiler and start again, while profiling continues
+                        Profile.clear()
+                        Profile.start_timer()
+
+                        # analyze and store data to file from where we will upload it
+                        PProf.pprof(data; web=false, out=outpath)
+                        upload_pprof(outpath; t_start=t_start, t_end=t_end, profile_type=string(kind))
+
+                    elseif kind == :allocs
+                        Profile.Allocs.stop()
+                        data = Profile.Allocs.fetch()
+                        t_start = last_upload_time
+                        t_end = now()
+
+                        # fetch alloc data
+                        data = Profile.Allocs.fetch()
+
+                        # clear profiler and start again, while profiling continues
+                        Profile.Allocs.clear()
+                        Profile.Allocs.start(; sample_rate=config.alloc_sample_rate)
+
+                        # analyze and store data to file from where we will upload it
+                        PProf.Allocs.pprof(data; web=false, out=outpath)
+                        upload_pprof(outpath; t_start=t_start, t_end=t_end, profile_type=string(kind))
+                    else
+                        error("[Pyroscope.jl] Unknown profile kind: $kind")
+                    end
+
+                    last_upload_time = now()
+                end
+            end
+        catch e
+            println("[Pyroscope.jl] $kind-profiler failed: $e")
         end
-        println("$(kind) profiler task stopped.")
+
+
+        println("[Pyroscope.jl] $(kind) profiler stopped gracefully.")
     end
 end
 
-function start_profiling(; interval::Float64=60.0, duration::Float64=5.0, enable_cpu::Bool=true, enable_alloc::Bool=true)
-    config = ProfilerConfig(interval, duration, enable_cpu, enable_alloc)
-    println("Starting continuous profiler (Julia 1.11-compatible).")
+function start_profiling(config::ProfilerConfig=ProfilerConfig())
+    println("[Pyroscope.jl] Starting Pyroscope continuous profiler...")
 
-    Profile.init(; delay=0.005)
-
-    push!(profiler_tasks[], run_profiler_task(:cpu, config))
-    push!(profiler_tasks[], run_profiler_task(:allocs, config))
+    if config.enable_cpu
+        run_profiler_task(:cpu, config)
+    end
+    if config.enable_alloc
+        run_profiler_task(:allocs, config)
+    end
 end
 
 # ------------------------------------------------------------------
@@ -136,14 +190,13 @@ function example()
 
             x = rand(1000)
             s = sum(sin, x)
-            sleep(0.01)
         end
     end
 
     @spawn busy_loop()
-    interval = parse(Float64, get(ENV, "PYROSCOPE_INTERVAL", "30"))
-    duration = parse(Float64, get(ENV, "PYROSCOPE_DURATION", "5"))
-    start_profiling(interval=interval, duration=duration, enable_cpu=true, enable_alloc=true)
+    # interval = parse(Float64, get(ENV, "PYROSCOPE_INTERVAL", "30"))
+    # duration = parse(Float64, get(ENV, "PYROSCOPE_DURATION", "5"))
+    start_profiling()
 
     # Keep main thread alive and handle Ctrl+C for graceful shutdown
     try
@@ -166,6 +219,6 @@ end
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    using .PyroscopePProf
-    PyroscopePProf.example()
+    using .Pyroscope
+    Pyroscope.example()
 end
